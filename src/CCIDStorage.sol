@@ -2,10 +2,11 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import {StorageSender} from "./StorageSender.sol";
 
 /**
  * @title CCIDStorage
- * @notice Stores CCID membership data. Only approved contracts can modify data.
+ * @notice Stores CCID membership data and triggers cross-chain updates via StorageSender.
  */
 contract CCIDStorage is Ownable {
     enum CCIDType { INDIVIDUAL, COMMUNITY }
@@ -16,17 +17,17 @@ contract CCIDStorage is Ownable {
     }
 
     struct IndividualCCID {
-        address creator; // Cannot be removed (Index 0)
-        uint256 totalAddresses; // Number of linked addresses
-        mapping(uint256 => ChainAddress) addresses; // index => (chainId, address)
-        mapping(bytes32 => uint256) addressToIndex; // (chainId, address) => index
+        address creator;
+        uint256 totalAddresses;
+        mapping(uint256 => ChainAddress) addresses;
+        mapping(bytes32 => uint256) addressToIndex;
     }
 
     struct CommunityCCID {
-        address creator; // Cannot be removed (Index 0)
-        uint256 totalMembers; // Number of linked members (CCIDs)
-        mapping(uint256 => bytes32) members; // index => CCID
-        mapping(bytes32 => uint256) ccidToIndex; // CCID => index
+        address creator;
+        uint256 totalMembers;
+        mapping(uint256 => bytes32) members;
+        mapping(bytes32 => uint256) ccidToIndex;
     }
 
     // Storage for Individuals & Communities
@@ -37,6 +38,9 @@ contract CCIDStorage is Ownable {
     // Allowed contracts for modifying data
     address public individualManager;
     address public communityManager;
+    address public storageSender;
+
+    uint256 public totalCCIDs; // 🔹 Track the number of CCIDs created
 
     /*//////////////////////////////////////////////////////////////
                            EVENTS
@@ -49,12 +53,13 @@ contract CCIDStorage is Ownable {
     event CommunityMemberAdded(bytes32 indexed communityCCID, bytes32 indexed memberCCID);
     event CommunityMemberRemoved(bytes32 indexed communityCCID, bytes32 indexed memberCCID);
     event ManagersUpdated(address indexed newIndividualManager, address indexed newCommunityManager);
+    event StorageSenderUpdated(address indexed newStorageSender);
 
     /*//////////////////////////////////////////////////////////////
                            CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
-    constructor(address initialOwner) Ownable(initialOwner) {}
+    constructor() Ownable(msg.sender) {}
 
     /*//////////////////////////////////////////////////////////////
                       MODIFIERS & ACCESS CONTROL
@@ -70,17 +75,34 @@ contract CCIDStorage is Ownable {
         _;
     }
 
+    /*//////////////////////////////////////////////////////////////
+                        ADMIN FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
     function updateManagers(address _individualManager, address _communityManager) external onlyOwner {
         individualManager = _individualManager;
         communityManager = _communityManager;
         emit ManagersUpdated(_individualManager, _communityManager);
     }
 
+    function updateStorageSender(address _storageSender) external onlyOwner {
+        storageSender = _storageSender;
+        emit StorageSenderUpdated(_storageSender);
+    }
+
     /*//////////////////////////////////////////////////////////////
                       INDIVIDUAL CCID MANAGEMENT
     //////////////////////////////////////////////////////////////*/
 
-    function createIndividualCCID(bytes32 ccid, address creator) external onlyIndividualManager {
+    /**
+     * @notice Creates a new Individual CCID with a **unique auto-generated ID**.
+     * @param creator The creator of the CCID.
+     * @return ccid The newly created CCID.
+     */
+    function createIndividualCCID(address creator) external onlyIndividualManager returns (bytes32 ccid) {
+        totalCCIDs++;
+        ccid = keccak256(abi.encodePacked(block.timestamp, creator, totalCCIDs)); // 🔹 Auto-generate unique CCID
+
         require(individuals[ccid].totalAddresses == 0, "CCID already exists");
 
         individuals[ccid].creator = creator;
@@ -89,6 +111,11 @@ contract CCIDStorage is Ownable {
         individuals[ccid].addressToIndex[_makeAddressKey(block.chainid, creator)] = 0;
 
         emit IndividualCreated(ccid, creator);
+
+        // 🔹 Send Storage Update Across Chains
+        StorageSender(storageSender).sendStorageUpdate(
+            ccid, block.chainid, creator, true, creator
+        );
     }
 
     function linkAddress(bytes32 ccid, uint256 chainId, address linkedAddress) external onlyIndividualManager {
@@ -104,72 +131,45 @@ contract CCIDStorage is Ownable {
 
         addressToCCID[addrKey] = ccid;
         emit AddressLinked(ccid, chainId, linkedAddress);
+
+        // 🔹 Send Storage Update Across Chains
+        StorageSender(storageSender).sendStorageUpdate(
+            ccid, chainId, linkedAddress, true, identity.creator
+        );
     }
 
     function unlinkAddress(bytes32 ccid, uint256 chainId, address linkedAddress) external onlyIndividualManager {
-        IndividualCCID storage identity = individuals[ccid];
+    IndividualCCID storage identity = individuals[ccid];
 
-        bytes32 addrKey = _makeAddressKey(chainId, linkedAddress);
-        uint256 index = identity.addressToIndex[addrKey];
-        require(index != 0, "Address not linked");
-        require(linkedAddress != identity.creator, "Cannot remove creator");
+    bytes32 addrKey = _makeAddressKey(chainId, linkedAddress);
+    uint256 index = identity.addressToIndex[addrKey];
+    
+    require(index != 0, "Address not linked");  // 🔹 Ensure the address is actually linked
+    require(linkedAddress != identity.creator, "Cannot remove creator"); // 🔹 Prevent creator removal
 
-        uint256 lastIndex = identity.totalAddresses - 1;
-        if (index != lastIndex) {
-            ChainAddress storage lastAddress = identity.addresses[lastIndex];
-            identity.addresses[index] = lastAddress;
-            identity.addressToIndex[_makeAddressKey(lastAddress.chainId, lastAddress.addr)] = index;
-        }
+    uint256 lastIndex = identity.totalAddresses - 1;
 
-        delete identity.addresses[lastIndex];
-        delete identity.addressToIndex[addrKey];
-        delete addressToCCID[addrKey];
-        identity.totalAddresses--;
-
-        emit AddressUnlinked(ccid, chainId, linkedAddress);
+    if (index != lastIndex) {
+        // 🔹 Swap with the last entry before deleting to maintain a compact structure
+        ChainAddress storage lastAddress = identity.addresses[lastIndex];
+        identity.addresses[index] = lastAddress;
+        identity.addressToIndex[_makeAddressKey(lastAddress.chainId, lastAddress.addr)] = index;
     }
 
-    /*//////////////////////////////////////////////////////////////
-                      COMMUNITY CCID MANAGEMENT
-    //////////////////////////////////////////////////////////////*/
+    // 🔹 Delete the last index
+    delete identity.addresses[lastIndex];
+    delete identity.addressToIndex[addrKey];
+    delete addressToCCID[addrKey];
+    identity.totalAddresses--;
 
-    function createCommunityCCID(bytes32 ccid, address creator) external onlyCommunityManager {
-        require(communities[ccid].totalMembers == 0, "CCID already exists");
+    emit AddressUnlinked(ccid, chainId, linkedAddress);
 
-        communities[ccid].creator = creator;
-        emit CommunityCreated(ccid, creator);
-    }
+    // 🔹 Send Storage Update Across Chains
+    StorageSender(storageSender).sendStorageUpdate(
+        ccid, chainId, linkedAddress, false, identity.creator
+    );
+}
 
-    function addCommunityMember(bytes32 communityCCID, bytes32 memberCCID) external onlyCommunityManager {
-        CommunityCCID storage community = communities[communityCCID];
-
-        uint256 index = community.totalMembers;
-        community.members[index] = memberCCID;
-        community.ccidToIndex[memberCCID] = index;
-        community.totalMembers++;
-
-        emit CommunityMemberAdded(communityCCID, memberCCID);
-    }
-
-    function removeCommunityMember(bytes32 communityCCID, bytes32 memberCCID) external onlyCommunityManager {
-        CommunityCCID storage community = communities[communityCCID];
-
-        uint256 index = community.ccidToIndex[memberCCID];
-        require(index != 0, "Member not found");
-
-        uint256 lastIndex = community.totalMembers - 1;
-        if (index != lastIndex) {
-            bytes32 lastMember = community.members[lastIndex];
-            community.members[index] = lastMember;
-            community.ccidToIndex[lastMember] = index;
-        }
-
-        delete community.members[lastIndex];
-        delete community.ccidToIndex[memberCCID];
-        community.totalMembers--;
-
-        emit CommunityMemberRemoved(communityCCID, memberCCID);
-    }
 
     /*//////////////////////////////////////////////////////////////
                       VIEW FUNCTIONS
@@ -181,5 +181,9 @@ contract CCIDStorage is Ownable {
 
     function _makeAddressKey(uint256 chainId, address addr) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked(chainId, addr));
+    }
+
+    function getCCIDCreator(bytes32 ccid) external view returns (address) {
+        return individuals[ccid].creator;
     }
 }

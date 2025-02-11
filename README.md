@@ -1,3 +1,13 @@
+### CCID
+
+# This repo is currently under development - 
+
+- currently broken: Senders and receivers for individuals
+
+- need to add: fee strcuture, all community functionality 
+
+- run `npm install` to install chainlink contracts
+- to test `forge test --mc CCIDIndividualsTest -vvv`
 ## Foundry
 
 **Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
